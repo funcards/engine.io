@@ -11,7 +11,7 @@ Use go get.
 go get github.com/funcards/engine.io
 ```
 
-Then import the parser package into your own code.
+Then import **engine.io** package into your own code.
 
 ```go
 import "github.com/funcards/engine.io"
