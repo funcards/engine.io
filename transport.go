@@ -1,6 +1,7 @@
 package eio
 
 import (
+	"context"
 	"errors"
 	"github.com/funcards/engine.io-parser/v4"
 	"go.uber.org/zap"
@@ -24,8 +25,8 @@ type (
 		GetInitialQuery() url.Values
 		GetInitialHeaders() map[string]string
 		IsWritable() bool
-		Send(payload eiop.Payload) error
-		Close() error
+		Send(ctx context.Context, payload eiop.Payload)
+		Close(ctx context.Context)
 	}
 
 	transport struct {
@@ -48,38 +49,38 @@ func newTransport(logger *zap.Logger) *transport {
 	}
 }
 
-func (t *transport) Close() error {
+func (t *transport) Close(ctx context.Context) {
 	switch t.state {
 	case Closed, Closing:
-		return nil
+		return
 	}
 	t.state = Closing
-	return t.Emit("doClose")
+	t.Emit(ctx, "doClose")
 }
 
-func (t *transport) onError(reason, description string) error {
+func (t *transport) onError(ctx context.Context, reason, description string) {
 	if t.Has(TopicError) {
-		return t.Emit(TopicError, reason, description)
+		t.Emit(ctx, TopicError, reason, description)
 	}
-	return nil
 }
 
-func (t *transport) onPacket(packet eiop.Packet) error {
-	return t.Emit(TopicPacket, packet)
+func (t *transport) onPacket(ctx context.Context, packet eiop.Packet) {
+	t.Emit(ctx, TopicPacket, packet)
 }
 
-func (t *transport) onData(data any) error {
+func (t *transport) onData(ctx context.Context, data any) {
 	packet, err := eiop.DecodePacket(data)
 	if err != nil {
-		return err
+		t.log.Error("engine.io decode packet", zap.Any("data", data))
+		TryCancel(ctx, err)
+		return
 	}
-
-	return t.onPacket(packet)
+	t.onPacket(ctx, packet)
 }
 
-func (t *transport) onClose() error {
+func (t *transport) onClose(ctx context.Context) {
 	t.state = Closed
-	return t.Emit(TopicClose)
+	t.Emit(ctx, TopicClose)
 }
 
 func NewWebSocketTransport(webSocket WebSocket, logger *zap.Logger) *webSocketTransport {
@@ -87,17 +88,17 @@ func NewWebSocketTransport(webSocket WebSocket, logger *zap.Logger) *webSocketTr
 		transport: newTransport(logger),
 		webSocket: webSocket,
 	}
-	t.On("doClose", func(*Event) error {
-		return webSocket.Close()
+	t.On("doClose", func(ctx context.Context, _ *Event) {
+		webSocket.Close(ctx)
 	})
-	webSocket.On(TopicMessage, func(event *Event) error {
-		return t.onData(event.Get(0))
+	webSocket.On(TopicMessage, func(ctx context.Context, event *Event) {
+		t.onData(ctx, event.Get(0))
 	})
-	webSocket.On(TopicClose, func(*Event) error {
-		return t.onClose()
+	webSocket.On(TopicClose, func(ctx context.Context, _ *Event) {
+		t.onClose(ctx)
 	})
-	webSocket.On(TopicError, func(event *Event) error {
-		return t.onError(event.String(0), event.String(1))
+	webSocket.On(TopicError, func(ctx context.Context, event *Event) {
+		t.onError(ctx, event.String(0), event.String(1))
 	})
 
 	return t
@@ -119,16 +120,13 @@ func (t *webSocketTransport) IsWritable() bool {
 	return true
 }
 
-func (t *webSocketTransport) Send(payload eiop.Payload) error {
+func (t *webSocketTransport) Send(ctx context.Context, payload eiop.Payload) {
 	for _, packet := range payload {
 		switch packet.Data.(type) {
 		case []byte, string, nil:
-			if err := t.webSocket.Write(packet.Encode(true)); err != nil {
-				return err
-			}
+			t.webSocket.Write(ctx, packet.Encode(true))
 		default:
-			return ErrInvalidPacketData
+			TryCancel(ctx, ErrInvalidPacketData)
 		}
 	}
-	return nil
 }

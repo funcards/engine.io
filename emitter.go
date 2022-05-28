@@ -1,6 +1,7 @@
 package eio
 
 import (
+	"context"
 	"go.uber.org/zap"
 	"reflect"
 	"sync"
@@ -31,14 +32,14 @@ type (
 		Args  []any
 	}
 
-	Listener func(event *Event) error
+	Listener func(ctx context.Context, event *Event)
 
 	Emitter interface {
 		On(topic string, listeners ...Listener)
 		Once(topic string, listeners ...Listener)
 		OffListeners(topic string, listeners ...Listener)
 		Off(topics ...string)
-		Emit(topic string, args ...any) error
+		Emit(ctx context.Context, topic string, args ...any)
 		Has(topic string) bool
 		Listeners(topic string) []Listener
 	}
@@ -105,9 +106,9 @@ func once(emitter Emitter, topic string, listeners ...Listener) []Listener {
 
 	for i, listener := range listeners {
 		var fn Listener
-		fn = func(event *Event) error {
+		fn = func(ctx context.Context, event *Event) {
 			emitter.OffListeners(topic, fn)
-			return listener(event)
+			listener(ctx, event)
 		}
 		data[i] = fn
 	}
@@ -126,10 +127,10 @@ func (e *emitter) On(topic string, listeners ...Listener) {
 		return
 	}
 
+	e.log.Debug("emitter.On", zap.String("topic", topic))
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	e.log.Debug("subscribe", zap.String("topic", topic))
 
 	if !e.has(topic) {
 		e.listeners[topic] = listeners
@@ -139,11 +140,13 @@ func (e *emitter) On(topic string, listeners ...Listener) {
 }
 
 func (e *emitter) Once(topic string, listeners ...Listener) {
-	e.log.Debug("subscribe once", zap.String("topic", topic))
+	e.log.Debug("emitter.Once", zap.String("topic", topic))
 	e.On(topic, once(e, topic, listeners...)...)
 }
 
 func (e *emitter) OffListeners(topic string, listeners ...Listener) {
+	e.log.Debug("emitter.OffListeners", zap.String("topic", topic))
+
 	e.mu.RLock()
 	data, ok := e.listeners[topic]
 	e.mu.RUnlock()
@@ -151,8 +154,6 @@ func (e *emitter) OffListeners(topic string, listeners ...Listener) {
 	if !ok {
 		return
 	}
-
-	e.log.Debug("turn off listener for topic", zap.String("topic", topic))
 
 	if len(listeners) == 0 {
 		e.mu.Lock()
@@ -183,10 +184,10 @@ func (e *emitter) OffListeners(topic string, listeners ...Listener) {
 }
 
 func (e *emitter) Off(topics ...string) {
+	e.log.Debug("emitter.Off", zap.Strings("topics", topics))
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	e.log.Debug("turn off listeners", zap.Strings("topics", topics))
 
 	if len(topics) == 0 {
 		e.listeners = make(map[string][]Listener)
@@ -199,26 +200,23 @@ func (e *emitter) Off(topics ...string) {
 	}
 }
 
-func (e *emitter) Emit(topic string, args ...any) error {
+func (e *emitter) Emit(ctx context.Context, topic string, args ...any) {
+	e.log.Debug("emitter.Emit", zap.String("topic", topic), zap.Any("args", args))
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if !e.has(topic) {
-		return nil
-	}
-
-	e.log.Debug("emit event", zap.String("topic", topic), zap.Any("args", args))
-
-	event := Event{Topic: topic, Args: args}
-	for _, listener := range e.listeners[topic] {
-		if err := listener(&event); err != nil {
-			e.log.Warn("error emit topic", zap.String("topic", topic))
+	if e.has(topic) {
+		event := Event{Topic: topic, Args: args}
+		for _, listener := range e.listeners[topic] {
+			listener(ctx, &event)
 		}
 	}
-	return nil
 }
 
 func (e *emitter) Has(topic string) bool {
+	e.log.Debug("emitter.Has", zap.String("topic", topic))
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 

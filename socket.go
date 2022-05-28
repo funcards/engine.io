@@ -1,6 +1,7 @@
 package eio
 
 import (
+	"context"
 	"fmt"
 	"github.com/funcards/engine.io-parser/v4"
 	"go.uber.org/zap"
@@ -36,11 +37,11 @@ type (
 		GetState() State
 		GetInitialQuery() url.Values
 		GetInitialHeaders() map[string]string
-		Send(packet eiop.Packet) error
-		Open(transport Transport) error
-		Upgrade(transport Transport) error
+		Send(ctx context.Context, packet eiop.Packet)
+		Open(ctx context.Context, transport Transport)
+		Upgrade(transport Transport)
 		CanUpgrade(transport string) bool
-		Close() error
+		Close(ctx context.Context)
 	}
 
 	socket struct {
@@ -73,9 +74,9 @@ func NewSocket(sid string, cfg Config, logger *zap.Logger) *socket {
 	}
 }
 
-func (s *socket) Emit(topic string, args ...any) error {
+func (s *socket) Emit(ctx context.Context, topic string, args ...any) {
 	args = append([]any{s}, args...)
-	return s.Emitter.Emit(topic, args...)
+	s.Emitter.Emit(ctx, topic, args...)
 }
 
 func (s *socket) GetSID() string {
@@ -98,18 +99,18 @@ func (s *socket) GetInitialHeaders() map[string]string {
 	return s.initialHeaders
 }
 
-func (s *socket) Send(packet eiop.Packet) error {
-	return s.sendPacket(packet)
+func (s *socket) Send(ctx context.Context, packet eiop.Packet) {
+	s.sendPacket(ctx, packet)
 }
 
-func (s *socket) Open(transport Transport) error {
+func (s *socket) Open(ctx context.Context, transport Transport) {
 	s.setTransport(transport)
 	s.initialQuery = transport.GetInitialQuery()
 	s.initialHeaders = transport.GetInitialHeaders()
-	return s.onOpen()
+	s.onOpen(ctx)
 }
 
-func (s *socket) Upgrade(transport Transport) error {
+func (s *socket) Upgrade(transport Transport) {
 	atomic.StoreInt32(&(s.upgrading), 1)
 
 	cleanup := func() {
@@ -117,90 +118,72 @@ func (s *socket) Upgrade(transport Transport) error {
 		transport.Off(TopicPacket, TopicClose, TopicError)
 	}
 
-	onError := func(event *Event) error {
+	onError := func(ctx context.Context, event *Event) {
 		cleanup()
-		return transport.Close()
+		transport.Close(ctx)
 	}
 
-	transport.On(TopicPacket, func(event *Event) error {
+	transport.On(TopicPacket, func(ctx context.Context, event *Event) {
 		packet := event.Get(0).(eiop.Packet)
 
 		if str, ok := packet.Data.(string); ok && "probe" == str && packet.Type == eiop.Ping {
 			reply := eiop.PongPacket("probe")
 
-			if err := transport.Send(eiop.Payload{reply}); err != nil {
-				return err
-			}
+			transport.Send(ctx, eiop.Payload{reply})
 
 			if s.transport.IsWritable() {
-				if err := s.transport.Send(eiop.Payload{eiop.NoopPacket}); err != nil {
-					return err
-				}
+				s.transport.Send(ctx, eiop.Payload{eiop.NoopPacket})
 			}
-
-			return s.Emit(TopicUpgrading, transport)
+			s.Emit(ctx, TopicUpgrading, transport)
 		} else if packet.Type == eiop.Upgrade && s.state != Closed && s.state != Closing {
 			cleanup()
-			if err := s.clearTransport(); err != nil {
-				return err
-			}
-
+			s.clearTransport(ctx)
 			s.setTransport(transport)
-
-			if err := s.Emit(TopicUpgrading, transport); err != nil {
-				return err
-			}
-			if err := s.flush(); err != nil {
-				return err
-			}
-
+			s.Emit(ctx, TopicUpgrading, transport)
+			s.flush(ctx)
 			s.schedulePing()
 		} else {
 			cleanup()
-			return transport.Close()
+			transport.Close(ctx)
 		}
-		return nil
 	})
 	transport.Once(TopicClose, onError)
 	transport.Once(TopicError, onError)
 
 	s.Once(TopicClose, onError)
-
-	return nil
 }
 
 func (s *socket) CanUpgrade(transport string) bool {
 	return atomic.LoadInt32(&(s.upgrading)) == 0 && s.transport.GetName() != TransportWebSocket && TransportWebSocket == transport
 }
 
-func (s *socket) Close() error {
+func (s *socket) Close(ctx context.Context) {
 	if s.state == Open {
 		s.state = Closing
 
 		if len(s.payload) > 0 {
-			s.transport.On(TopicDrain, func(*Event) error {
-				return s.closeTransport()
+			s.transport.On(TopicDrain, func(ctx context.Context, _ *Event) {
+				s.closeTransport(ctx)
 			})
 		} else {
-			return s.closeTransport()
+			s.closeTransport(ctx)
 		}
 	}
-	return nil
 }
 
 func (s *socket) setTransport(transport Transport) {
 	s.transport = transport
-	transport.Once(TopicError, func(*Event) error {
-		return s.onError()
+	transport.Once(TopicError, func(ctx context.Context, _ *Event) {
+		s.onError(ctx)
 	})
-	transport.Once(TopicClose, func(event *Event) error {
-		return s.onClose("transport close", event.String(0))
+	transport.Once(TopicClose, func(ctx context.Context, event *Event) {
+		s.onClose(ctx, "transport close", event.String(0))
 	})
-	transport.On(TopicPacket, func(event *Event) error {
-		return s.onPacket(event.Get(0).(eiop.Packet))
+	transport.On(TopicPacket, func(ctx context.Context, event *Event) {
+		s.onPacket(ctx, event.Get(0).(eiop.Packet))
 	})
-	transport.On(TopicDrain, func(*Event) error {
-		return s.flush()
+	transport.On(TopicDrain, func(ctx context.Context, _ *Event) {
+		s.flush(ctx)
 	})
 
 	s.cleanup = func() {
@@ -208,18 +191,18 @@ func (s *socket) setTransport(transport Transport) {
 	}
 }
 
-func (s *socket) closeTransport() error {
-	return s.transport.Close()
+func (s *socket) closeTransport(ctx context.Context) {
+	s.transport.Close(ctx)
 }
 
-func (s *socket) clearTransport() error {
+func (s *socket) clearTransport(ctx context.Context) {
 	if s.cleanup != nil {
 		s.cleanup()
 	}
-	return s.transport.Close()
+	s.transport.Close(ctx)
 }
 
-func (s *socket) onOpen() error {
+func (s *socket) onOpen(ctx context.Context) {
 	s.state = Open
 
 	var upgrades string
@@ -230,121 +213,91 @@ func (s *socket) onOpen() error {
 	}
 
 	packet := eiop.OpenPacket(fmt.Sprintf(HandshakeJSON, s.sid, upgrades, s.cfg.PingInterval.Milliseconds(), s.cfg.PingTimeout.Milliseconds()))
-	if err := s.sendPacket(packet); err != nil {
-		return err
-	}
+	s.sendPacket(ctx, packet)
 
 	if s.cfg.InitialPacket != nil {
-		if err := s.sendPacket(*s.cfg.InitialPacket); err != nil {
-			return err
-		}
+		s.sendPacket(ctx, *s.cfg.InitialPacket)
 	}
-
-	if err := s.Emit(TopicOpen); err != nil {
-		return err
-	}
-
+	s.Emit(ctx, TopicOpen)
 	s.schedulePing()
-
-	return nil
 }
 
-func (s *socket) onClose(reason, description string) error {
+func (s *socket) onClose(ctx context.Context, reason, description string) {
 	if s.state != Closed {
 		s.state = Closed
 
 		s.stopTimers()
-
-		if err := s.clearTransport(); err != nil {
-			return err
-		}
-		return s.Emit(TopicClose, reason, description)
+		s.clearTransport(ctx)
+		s.Emit(ctx, TopicClose, reason, description)
 	}
-
-	return nil
 }
 
-func (s *socket) onError() error {
-	return s.onClose("transport error", "")
+func (s *socket) onError(ctx context.Context) {
+	s.onClose(ctx, "transport error", "")
 }
 
-func (s *socket) onPacket(packet eiop.Packet) error {
+func (s *socket) onPacket(ctx context.Context, packet eiop.Packet) {
 	if s.state != Open {
-		return nil
+		return
 	}
 
-	if err := s.Emit(TopicPacket, packet); err != nil {
-		return err
-	}
+	s.Emit(ctx, TopicPacket, packet)
 
 	s.resetPingTimeout(s.cfg.PingTimeout + s.cfg.PingInterval)
 
 	switch packet.Type {
 	case eiop.Ping:
 		s.log.Debug("received ping")
-		return s.onError()
+		s.onError(ctx)
 	case eiop.Pong:
 		s.log.Debug("received pong")
 		s.schedulePing()
-		return s.Emit(TopicHeartbeat)
+		s.Emit(ctx, TopicHeartbeat)
 	case eiop.Error:
-		return s.onClose("parse error", "")
+		s.onClose(ctx, "parse error", "")
 	case eiop.Message:
-		if err := s.Emit(TopicData, packet.Data); err != nil {
-			return err
-		}
-		return s.Emit(TopicMessage, packet.Data)
+		s.Emit(ctx, TopicData, packet.Data)
+		s.Emit(ctx, TopicMessage, packet.Data)
 	}
-
-	return nil
 }
 
-func (s *socket) sendPacket(packet eiop.Packet) error {
+func (s *socket) sendPacket(ctx context.Context, packet eiop.Packet) {
 	switch s.state {
 	case Closing, Closed:
-		return nil
+		return
 	}
 
 	s.mu.Lock()
 	s.payload = append(s.payload, packet)
 	s.mu.Unlock()
 
-	return s.flush()
+	s.flush(ctx)
 }
 
-func (s *socket) flush() error {
+func (s *socket) flush(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.log.Debug("eio.socket flush", zap.Any("payload", s.payload))
 
 	if s.state != Closed && s.transport.IsWritable() && len(s.payload) > 0 {
-		if err := s.Emit(TopicFlush, append(eiop.Payload{}, s.payload...)); err != nil {
-			return err
-		}
-		if err := s.transport.Send(s.payload); err != nil {
-			return err
-		}
+		s.Emit(ctx, TopicFlush, append(eiop.Payload{}, s.payload...))
+		s.transport.Send(ctx, s.payload)
 		s.payload = make(eiop.Payload, 0)
-
-		return s.Emit(TopicDrain)
+		s.Emit(ctx, TopicDrain)
 	}
-	return nil
 }
 
 func (s *socket) pingInterval() {
 	s.log.Debug("eio.Socket ping interval", zap.String("sid", s.GetSID()))
 
-	if err := s.sendPacket(eiop.PingPacket()); err != nil {
-		s.log.Warn("eio.Socket ping interval send", zap.Error(err))
-	}
+	s.sendPacket(context.Background(), eiop.PingPacket())
 	s.resetPingTimeout(s.cfg.PingTimeout)
 }
 
 func (s *socket) pingTimeout() {
 	s.log.Debug("eio.Socket ping timeout", zap.String("sid", s.GetSID()))
-
-	_ = s.onClose("ping timeout", "")
+	s.onClose(context.Background(), "ping timeout", "")
 }
 
 func (s *socket) schedulePing() {

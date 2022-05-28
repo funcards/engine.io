@@ -1,6 +1,7 @@
 package eio
 
 import (
+	"context"
 	"errors"
 	"github.com/funcards/engine.io-parser/v4"
 	"go.uber.org/zap"
@@ -25,9 +26,9 @@ type (
 		Emitter
 
 		GetConfig() Config
-		Shutdown() error
-		HandleRequest(w http.ResponseWriter, r *http.Request) error
-		HandleWebSocket(webSocket WebSocket) error
+		Shutdown()
+		HandleRequest(ctx context.Context, w http.ResponseWriter, r *http.Request)
+		HandleWebSocket(ctx context.Context, webSocket WebSocket)
 	}
 
 	server struct {
@@ -59,7 +60,7 @@ func (s *server) GetConfig() Config {
 	return s.cfg
 }
 
-func (s *server) Shutdown() error {
+func (s *server) Shutdown() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -69,55 +70,50 @@ func (s *server) Shutdown() error {
 		}
 		delete(s.clients, sid)
 	}
-
-	return nil
 }
 
-func (s *server) HandleRequest(w http.ResponseWriter, r *http.Request) error {
-	return errors.New("not support, transport not implemented")
+func (s *server) HandleRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	TryCancel(ctx, errors.New("not support, transport not implemented"))
 }
 
-func (s *server) HandleWebSocket(webSocket WebSocket) error {
+func (s *server) HandleWebSocket(ctx context.Context, webSocket WebSocket) {
 	if sid, ok := webSocket.GetQuery()["sid"]; ok {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 
 		if sck, ok := s.clients[sid[0]]; ok && sck.CanUpgrade(TransportWebSocket) {
 			t := NewWebSocketTransport(webSocket, s.log)
-			return sck.Upgrade(t)
+			sck.Upgrade(t)
+		} else {
+			webSocket.Close(ctx)
 		}
-		return webSocket.Close()
+		return
 	}
 
 	if s.interceptor == nil || s.interceptor.Intercept(webSocket.GetQuery(), webSocket.GetHeaders()) {
-		return s.handshakeWebSocket(webSocket)
+		s.handshakeWebSocket(ctx, webSocket)
+	} else {
+		webSocket.Close(ctx)
 	}
-
-	return webSocket.Close()
 }
 
-func (s *server) handshakeWebSocket(webSocket WebSocket) error {
+func (s *server) handshakeWebSocket(ctx context.Context, webSocket WebSocket) {
 	sid := NewSID()
 	t := NewWebSocketTransport(webSocket, s.log)
 	sck := NewSocket(sid, s.cfg, s.log)
 
 	s.log.Debug("handshake websocket", zap.Any("query", webSocket.GetQuery()), zap.Any("headers", webSocket.GetHeaders()))
 
-	if err := sck.Open(t); err != nil {
-		return err
-	}
+	sck.Open(ctx, t)
 
 	s.mu.Lock()
 	s.clients[sid] = sck
 	s.mu.Unlock()
 
-	sck.Once(TopicClose, func(*Event) error {
+	sck.Once(TopicClose, func(context.Context, *Event) {
 		s.mu.Lock()
 		delete(s.clients, sid)
 		s.mu.Unlock()
-
-		return nil
 	})
-
-	return s.Emit(TopicConnection, sck)
+	s.Emit(ctx, TopicConnection, sck)
 }
