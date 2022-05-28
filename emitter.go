@@ -212,7 +212,7 @@ func (e *emitter) Emit(topic string, args ...any) error {
 	event := Event{Topic: topic, Args: args}
 	for _, listener := range e.listeners[topic] {
 		if err := listener(&event); err != nil {
-			return err
+			e.log.Warn("error emit topic", zap.String("topic", topic))
 		}
 	}
 	return nil
