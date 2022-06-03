@@ -1,15 +1,16 @@
 package eio
 
 import (
-	"context"
+	"github.com/funcards/engine.io-parser/v4"
+	"io"
 	"net/url"
 )
 
 type WebSocket interface {
+	io.Closer
 	Emitter
 
-	GetQuery() url.Values
-	GetHeaders() map[string]string
-	Write(ctx context.Context, data any)
-	Close(ctx context.Context)
+	Query() url.Values
+	Headers() map[string]string
+	Write(packet eiop.Packet)
 }

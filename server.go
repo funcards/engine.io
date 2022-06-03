@@ -1,46 +1,41 @@
 package eio
 
 import (
-	"context"
 	"errors"
 	"github.com/funcards/engine.io-parser/v4"
 	"go.uber.org/zap"
-	"net/http"
 	"net/url"
 	"sync"
 	"time"
 )
 
-type (
-	Config struct {
-		PingInterval  time.Duration `yaml:"ping_interval" env-default:"30s" env:"EIO_PING_INTERVAL"`
-		PingTimeout   time.Duration `yaml:"ping_timeout" env-default:"1m" env:"EIO_PING_TIMEOUT"`
-		InitialPacket *eiop.Packet  `yaml:"initial_packet"`
-	}
+var _ Server = (*server)(nil)
 
-	HandshakeInterceptor interface {
-		Intercept(query url.Values, headers map[string]string) bool
-	}
+type Config struct {
+	PingInterval  time.Duration `yaml:"ping_interval" env-default:"30s" env:"EIO_PING_INTERVAL"`
+	PingTimeout   time.Duration `yaml:"ping_timeout" env-default:"1m" env:"EIO_PING_TIMEOUT"`
+	InitialPacket *eiop.Packet  `yaml:"initial_packet"`
+}
 
-	Server interface {
-		Emitter
+type HandshakeInterceptor func(query url.Values, headers map[string]string) bool
 
-		GetConfig() Config
-		Shutdown()
-		HandleRequest(ctx context.Context, w http.ResponseWriter, r *http.Request)
-		HandleWebSocket(ctx context.Context, webSocket WebSocket)
-	}
+type Server interface {
+	Emitter
 
-	server struct {
-		Emitter
+	Cfg() Config
+	Shutdown()
+	HandleWebSocket(ws WebSocket) error
+}
 
-		cfg         Config
-		log         *zap.Logger
-		interceptor HandshakeInterceptor
-		clients     map[string]Socket
-		mu          sync.RWMutex
-	}
-)
+type server struct {
+	Emitter
+
+	interceptor HandshakeInterceptor
+	cfg         Config
+	log         *zap.Logger
+	clients     *sync.Map
+	stop        chan struct{}
+}
 
 func NewServer(cfg Config, logger *zap.Logger) *server {
 	return NewServerWithInterceptor(cfg, logger, nil)
@@ -48,72 +43,56 @@ func NewServer(cfg Config, logger *zap.Logger) *server {
 
 func NewServerWithInterceptor(cfg Config, logger *zap.Logger, interceptor HandshakeInterceptor) *server {
 	return &server{
-		Emitter:     NewEmitter(logger),
+		Emitter:     NewEmitter(),
 		cfg:         cfg,
 		log:         logger,
 		interceptor: interceptor,
-		clients:     make(map[string]Socket),
+		clients:     new(sync.Map),
+		stop:        make(chan struct{}, 1),
 	}
 }
 
-func (s *server) GetConfig() Config {
+func (s *server) Cfg() Config {
 	return s.cfg
 }
 
 func (s *server) Shutdown() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	close(s.stop)
+	s.clients.Range(func(key, value any) bool {
+		_ = value.(Socket).Close()
+		s.clients.Delete(key)
+		return true
+	})
+}
 
-	for sid, client := range s.clients {
-		if sck, ok := client.(*socket); ok {
-			sck.stopTimers()
-		}
-		delete(s.clients, sid)
+func (s *server) HandleWebSocket(ws WebSocket) error {
+	if s.interceptor == nil || s.interceptor(ws.Query(), ws.Headers()) {
+		s.handshakeWebSocket(ws)
+		return nil
 	}
+
+	return errors.New("websocket don't pass interceptor")
 }
 
-func (s *server) HandleRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	TryCancel(ctx, errors.New("not support, transport not implemented"))
+func (s *server) handshakeWebSocket(ws WebSocket) {
+	s.log.Debug("eio.server handshake websocket", zap.Any("query", ws.Query()), zap.Any("headers", ws.Headers()))
+
+	sck := NewSocket(s.cfg, ws, s.log)
+	s.clients.Store(sck.SID(), sck)
+
+	go s.run(sck)
+	s.Fire(TopicConnection, sck)
 }
 
-func (s *server) HandleWebSocket(ctx context.Context, webSocket WebSocket) {
-	if sid, ok := webSocket.GetQuery()["sid"]; ok {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
+func (s *server) run(sck Socket) {
+	onClose := sck.Once(TopicClose)
+	defer sck.Off(TopicClose, onClose)
 
-		if sck, ok := s.clients[sid[0]]; ok && sck.CanUpgrade(TransportWebSocket) {
-			t := NewWebSocketTransport(webSocket, s.log)
-			sck.Upgrade(t)
-		} else {
-			webSocket.Close(ctx)
-		}
+	select {
+	case <-s.stop:
+		return
+	case <-onClose:
+		s.clients.Delete(sck.SID())
 		return
 	}
-
-	if s.interceptor == nil || s.interceptor.Intercept(webSocket.GetQuery(), webSocket.GetHeaders()) {
-		s.handshakeWebSocket(ctx, webSocket)
-	} else {
-		webSocket.Close(ctx)
-	}
-}
-
-func (s *server) handshakeWebSocket(ctx context.Context, webSocket WebSocket) {
-	sid := NewSID()
-	t := NewWebSocketTransport(webSocket, s.log)
-	sck := NewSocket(sid, s.cfg, s.log)
-
-	s.log.Debug("handshake websocket", zap.Any("query", webSocket.GetQuery()), zap.Any("headers", webSocket.GetHeaders()))
-
-	sck.Open(ctx, t)
-
-	s.mu.Lock()
-	s.clients[sid] = sck
-	s.mu.Unlock()
-
-	sck.Once(TopicClose, func(context.Context, *Event) {
-		s.mu.Lock()
-		delete(s.clients, sid)
-		s.mu.Unlock()
-	})
-	s.Emit(ctx, TopicConnection, sck)
 }
